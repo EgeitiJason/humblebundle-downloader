@@ -41,3 +41,15 @@ def test_retry_count_custom():
         ["-l", "some_path", "-c", "fake_cookie", "-r", "5"]
     )
     assert args.retry_count == 5
+
+
+def test_concurrent_default():
+    args = parse_args(["-l", "some_path", "-c", "fake_cookie"])
+    assert args.concurrent == 1
+
+
+def test_concurrent_custom():
+    args = parse_args(
+        ["-l", "some_path", "-c", "fake_cookie", "-w", "4"]
+    )
+    assert args.concurrent == 4

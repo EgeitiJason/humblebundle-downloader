@@ -284,3 +284,69 @@ def test_process_download_no_retries(mock_sleep, tmp_path):
     assert result is False
     assert mock_dl.call_count == 1
     mock_sleep.assert_not_called()
+
+
+###
+# concurrent / max_workers
+###
+def test_max_workers_default():
+    dl = DownloadLibrary("fake_library_path")
+    assert dl.max_workers == 1
+
+
+def test_max_workers_custom():
+    dl = DownloadLibrary("fake_library_path", max_workers=4)
+    assert dl.max_workers == 4
+
+
+def test_progress_bar_works_when_concurrent():
+    dl = DownloadLibrary("fake_library_path", progress_bar=True, max_workers=4)
+    assert dl.progress_bar is True
+
+
+def test_progress_bar_kept_when_single_worker():
+    dl = DownloadLibrary("fake_library_path", progress_bar=True, max_workers=1)
+    assert dl.progress_bar is True
+
+
+def test_bar_positions_match_max_workers():
+    dl = DownloadLibrary("fake_library_path", max_workers=4)
+    assert dl._bar_positions.qsize() == 4
+
+
+def test_cache_lock_exists():
+    dl = DownloadLibrary("fake_library_path")
+    assert hasattr(dl, "_cache_lock")
+
+
+def test_thread_safe_cache_update(tmp_path):
+    import threading
+
+    dl = DownloadLibrary(str(tmp_path))
+    dl.cache_file = str(tmp_path / ".cache.json")
+    dl.cache_data = {}
+
+    errors = []
+
+    def update_cache(key):
+        try:
+            dl._update_cache_data(key, {"value": key})
+        except Exception as e:
+            errors.append(e)
+
+    threads = [
+        threading.Thread(target=update_cache, args=("key_{}".format(i),))
+        for i in range(10)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(errors) == 0
+    assert len(dl.cache_data) == 10
+    # Verify the cache file is valid JSON
+    import json
+    with open(dl.cache_file, "r") as f:
+        saved = json.load(f)
+    assert len(saved) == 10

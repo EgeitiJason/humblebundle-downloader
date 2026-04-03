@@ -2,11 +2,26 @@ import os
 import sys
 import json
 import time
+import queue
 import parsel
 import logging
 import datetime
+import threading
+import concurrent.futures
 import requests
 import http.cookiejar
+from tqdm import tqdm
+
+
+class TqdmLoggingHandler(logging.Handler):
+    """Routes log output through tqdm.write() to avoid collision with progress bars."""
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.write(msg)
+        except Exception:
+            self.handleError(record)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +51,7 @@ class DownloadLibrary:
         update=False,
         download_timeout=30,
         retry_count=3,
+        max_workers=1,
     ):
         self.library_path = library_path
         self.progress_bar = progress_bar
@@ -56,6 +72,11 @@ class DownloadLibrary:
         self.update = update
         self.download_timeout = download_timeout if download_timeout > 0 else None
         self.retry_count = retry_count
+        self.max_workers = max_workers
+        self._cache_lock = threading.Lock()
+        self._bar_positions = queue.Queue()
+        for i in range(max_workers):
+            self._bar_positions.put(i)
 
         self.session = requests.Session()
         if cookie_path:
@@ -79,14 +100,35 @@ class DownloadLibrary:
             self.purchase_keys if self.purchase_keys else self._get_purchase_keys()
         )
 
-        if self.trove is True:
-            logger.info("Only checking the Humble Trove...")
-            for product in self._get_trove_products():
-                title = _clean_name(product["human-name"])
-                self._process_trove_product(title, product)
-        else:
-            for order_id in self.purchase_keys:
-                self._process_order_id(order_id)
+        # When progress bars are active, route all log output through
+        # tqdm.write() so messages appear cleanly above the bars
+        if self.progress_bar:
+            root_logger = logging.getLogger()
+            original_handlers = root_logger.handlers[:]
+            root_logger.handlers.clear()
+            tqdm_handler = TqdmLoggingHandler()
+            tqdm_handler.setFormatter(logging.Formatter("%(message)s"))
+            root_logger.addHandler(tqdm_handler)
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.max_workers
+            ) as executor:
+                self._executor = executor
+                if self.trove is True:
+                    logger.info("Only checking the Humble Trove...")
+                    for product in self._get_trove_products():
+                        title = _clean_name(product["human-name"])
+                        self._process_trove_product(title, product)
+                else:
+                    for order_id in self.purchase_keys:
+                        self._process_order_id(order_id)
+                # Wait for all submitted downloads to complete
+                executor.shutdown(wait=True)
+        finally:
+            if self.progress_bar:
+                root_logger.removeHandler(tqdm_handler)
+                root_logger.handlers = original_handlers
 
     def _get_trove_download_url(self, machine_name, web_name):
         try:
@@ -141,7 +183,8 @@ class DownloadLibrary:
                 ),
                 "md5": download.get("md5", "UNKNOWN_MD5"),
             }
-            cache_file_info = self.cache_data.get(cache_file_key, {})
+            with self._cache_lock:
+                cache_file_info = self.cache_data.get(cache_file_key, {})
 
             if cache_file_info != {} and self.update is not True:
                 # Do not care about checking for updates at this time
@@ -168,7 +211,8 @@ class DownloadLibrary:
                 else:
                     uploaded_at = None
 
-                self._download_trove_file(
+                self._executor.submit(
+                    self._download_trove_file,
                     download,
                     web_name,
                     cache_file_key,
@@ -208,13 +252,9 @@ class DownloadLibrary:
             try:
                 self._download_file(signed_url, local_filename)
             except KeyboardInterrupt:
-                if self.progress_bar:
-                    print()
                 self._remove_partial_file(local_filename)
                 sys.exit()
             except Exception as e:
-                if self.progress_bar:
-                    print()
                 logger.warning(
                     "Trove download attempt {attempt} failed for "
                     "{local_filename}: {error}".format(
@@ -226,8 +266,6 @@ class DownloadLibrary:
                 continue
 
             # Success
-            if self.progress_bar:
-                print()
             self._update_cache_data(cache_file_key, file_info)
             return True
 
@@ -290,7 +328,9 @@ class DownloadLibrary:
         bundle_title = _clean_name(order["product"]["human_name"])
         logger.info("Checking bundle: " + str(bundle_title))
         for product in order["subproducts"]:
-            self._process_product(order_id, bundle_title, product)
+            self._executor.submit(
+                self._process_product, order_id, bundle_title, product
+            )
 
     def _rename_old_file(self, local_filename, append_str):
         # Check if older file exists, if so rename
@@ -488,23 +528,23 @@ class DownloadLibrary:
                     continue
 
     def _update_cache_data(self, cache_file_key, file_info):
-        self.cache_data[cache_file_key] = file_info
-        # Update cache file with newest data so if the script
-        # quits it can keep track of the progress
-        # Note: Only safe because of single thread,
-        # need to change if refactor to multi threading
-        with open(self.cache_file, "w") as outfile:
-            json.dump(
-                self.cache_data,
-                outfile,
-                sort_keys=True,
-                indent=4,
-            )
+        with self._cache_lock:
+            self.cache_data[cache_file_key] = file_info
+            # Update cache file with newest data so if the script
+            # quits it can keep track of the progress
+            with open(self.cache_file, "w") as outfile:
+                json.dump(
+                    self.cache_data,
+                    outfile,
+                    sort_keys=True,
+                    indent=4,
+                )
 
     def _check_cache_and_download(
         self, cache_file_key, remote_file, local_folder, local_filename
     ):
-        cache_file_info = self.cache_data.get(cache_file_key, {})
+        with self._cache_lock:
+            cache_file_info = self.cache_data.get(cache_file_key, {})
 
         if cache_file_info != {} and self.update is not True:
             # Do not care about checking for updates at this time
@@ -597,13 +637,9 @@ class DownloadLibrary:
             try:
                 self._download_file(url, local_filename)
             except KeyboardInterrupt:
-                if self.progress_bar:
-                    print()
                 self._remove_partial_file(local_filename)
                 sys.exit()
             except Exception as e:
-                if self.progress_bar:
-                    print()
                 logger.warning(
                     "Download attempt {attempt} failed for "
                     "{local_filename}: {error}".format(
@@ -616,8 +652,6 @@ class DownloadLibrary:
                 continue
 
             # Success
-            if self.progress_bar:
-                print()
             if "url_last_modified" not in file_info:
                 file_info["url_last_modified"] = datetime.datetime.now().strftime(
                     "%a, %d %b %Y %H:%M:%S %Z"
@@ -682,47 +716,45 @@ class DownloadLibrary:
             file_mode = "wb"
             existing_size = 0
 
+        bar_position = None
         try:
-            with open(local_filename, file_mode) as outfile:
-                total_length = product_r.headers.get("content-length")
-                if total_length is None:  # no content length header
-                    dl = 0
-                    for data in product_r.iter_content(chunk_size=4096):
-                        dl += len(data)
-                        outfile.write(data)
-                        if self.progress_bar:
-                            print(
-                                "\t{dl}".format(dl=existing_size + dl),
-                                end="\r",
-                                flush=True,
-                            )
-                else:
-                    dl = 0
-                    total_length = int(total_length)
-                    full_size = existing_size + total_length
-                    for data in product_r.iter_content(chunk_size=4096):
-                        dl += len(data)
-                        outfile.write(data)
-                        pb_width = 50
-                        done = int(pb_width * (existing_size + dl) / full_size)
-                        if self.progress_bar:
-                            print(
-                                "\t{percent}% [{filler}{space}]".format(
-                                    percent=int(done * (100 / pb_width)),
-                                    filler="=" * min(max(done, 0), pb_width),
-                                    space=" " * min(max((pb_width - done), 0), pb_width),
-                                ),
-                                end="\r",
-                                flush=True,
-                            )
+            total_length = product_r.headers.get("content-length")
+            total_length = int(total_length) if total_length else None
+            display_name = os.path.basename(local_filename)
 
-                    if dl < total_length:
-                        raise ValueError("Download did not complete")
-                    if dl > total_length:
-                        print()
-                        logger.warning("Downloaded more content than expected")
+            if self.progress_bar:
+                bar_position = self._bar_positions.get()
+                progress = tqdm(
+                    total=(existing_size + total_length) if total_length else None,
+                    initial=existing_size,
+                    unit="B",
+                    unit_scale=True,
+                    desc=display_name,
+                    position=bar_position,
+                    leave=False,
+                    miniters=1,
+                )
+
+            dl = 0
+            with open(local_filename, file_mode) as outfile:
+                for data in product_r.iter_content(chunk_size=4096):
+                    dl += len(data)
+                    outfile.write(data)
+                    if self.progress_bar:
+                        progress.update(len(data))
+
+            if self.progress_bar:
+                progress.close()
+
+            if total_length is not None:
+                if dl < total_length:
+                    raise ValueError("Download did not complete")
+                if dl > total_length:
+                    logger.warning("Downloaded more content than expected")
         finally:
             product_r.close()
+            if bar_position is not None:
+                self._bar_positions.put(bar_position)
 
     def _load_cache_data(self, cache_file):
         try:

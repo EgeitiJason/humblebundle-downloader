@@ -112,6 +112,16 @@ def parse_args(args):
             "Partial downloads are resumed on retry. 0 = no retries (default: 3)"
         ),
     )
+    parser.add_argument(
+        "-w",
+        "--concurrent",
+        type=int,
+        default=1,
+        help=(
+            "Number of simultaneous downloads. "
+            "Progress bars are disabled when > 1 (default: 1)"
+        ),
+    )
 
     return parser.parse_args(args)
 
@@ -134,4 +144,5 @@ def cli():
         update=cli_args.update,
         download_timeout=cli_args.download_timeout,
         retry_count=cli_args.retry_count,
+        max_workers=cli_args.concurrent,
     ).start()
