@@ -93,6 +93,25 @@ def parse_args(args):
             "products/bundle download page. Can set multiple"
         ),
     )
+    parser.add_argument(
+        "--download-timeout",
+        type=int,
+        default=30,
+        help=(
+            "Timeout in seconds for HTTP reads. Prevents downloads from "
+            "hanging on throttled connections. 0 = no timeout (default: 30)"
+        ),
+    )
+    parser.add_argument(
+        "-r",
+        "--retry-count",
+        type=int,
+        default=3,
+        help=(
+            "Number of retry attempts for failed downloads. "
+            "Partial downloads are resumed on retry. 0 = no retries (default: 3)"
+        ),
+    )
 
     return parser.parse_args(args)
 
@@ -113,4 +132,6 @@ def cli():
         purchase_keys=cli_args.keys,
         trove=cli_args.trove,
         update=cli_args.update,
+        download_timeout=cli_args.download_timeout,
+        retry_count=cli_args.retry_count,
     ).start()

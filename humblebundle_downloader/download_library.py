@@ -34,6 +34,8 @@ class DownloadLibrary:
         purchase_keys=None,
         trove=False,
         update=False,
+        download_timeout=30,
+        retry_count=3,
     ):
         self.library_path = library_path
         self.progress_bar = progress_bar
@@ -52,6 +54,8 @@ class DownloadLibrary:
         self.purchase_keys = purchase_keys
         self.trove = trove
         self.update = update
+        self.download_timeout = download_timeout if download_timeout > 0 else None
+        self.retry_count = retry_count
 
         self.session = requests.Session()
         if cookie_path:
@@ -92,6 +96,7 @@ class DownloadLibrary:
                     "machine_name": machine_name,
                     "filename": web_name,
                 },
+                timeout=self.download_timeout,
             )
         except Exception:
             logger.error(
@@ -155,21 +160,6 @@ class DownloadLibrary:
                     product_folder,
                     web_name,
                 )
-                signed_url = self._get_trove_download_url(
-                    download["machine_name"],
-                    web_name,
-                )
-                if signed_url is None:
-                    # Failed to get signed url. Error logged in fn
-                    continue
-
-                try:
-                    product_r = self.session.get(signed_url, stream=True)
-                except Exception:
-                    logger.error(
-                        "Failed to get trove product {title}".format(title=web_name)
-                    )
-                    continue
 
                 if "uploaded_at" in cache_file_info:
                     uploaded_at = time.strftime(
@@ -178,13 +168,78 @@ class DownloadLibrary:
                 else:
                     uploaded_at = None
 
-                self._process_download(
-                    product_r,
+                self._download_trove_file(
+                    download,
+                    web_name,
                     cache_file_key,
                     file_info,
                     local_filename,
                     rename_str=uploaded_at,
                 )
+
+    def _download_trove_file(
+        self, download, web_name, cache_file_key, file_info,
+        local_filename, rename_str=None
+    ):
+        if rename_str:
+            self._rename_old_file(local_filename, rename_str)
+
+        for attempt in range(1 + self.retry_count):
+            if attempt > 0:
+                wait_time = min(2 ** attempt, 30)
+                logger.info(
+                    "Retry {attempt}/{retry_count} for {local_filename} "
+                    "in {wait}s...".format(
+                        attempt=attempt,
+                        retry_count=self.retry_count,
+                        local_filename=local_filename,
+                        wait=wait_time,
+                    )
+                )
+                time.sleep(wait_time)
+
+            # Get a fresh signed URL for each attempt (signatures expire)
+            signed_url = self._get_trove_download_url(
+                download["machine_name"], web_name
+            )
+            if signed_url is None:
+                continue
+
+            try:
+                self._download_file(signed_url, local_filename)
+            except KeyboardInterrupt:
+                if self.progress_bar:
+                    print()
+                self._remove_partial_file(local_filename)
+                sys.exit()
+            except Exception as e:
+                if self.progress_bar:
+                    print()
+                logger.warning(
+                    "Trove download attempt {attempt} failed for "
+                    "{local_filename}: {error}".format(
+                        attempt=attempt + 1,
+                        local_filename=local_filename,
+                        error=e,
+                    )
+                )
+                continue
+
+            # Success
+            if self.progress_bar:
+                print()
+            self._update_cache_data(cache_file_key, file_info)
+            return True
+
+        logger.error(
+            "Failed to download trove file {local_filename} after "
+            "{attempts} attempts".format(
+                local_filename=local_filename,
+                attempts=1 + self.retry_count,
+            )
+        )
+        self._remove_partial_file(local_filename)
+        return False
 
     def _get_trove_products(self):
         trove_products = []
@@ -196,7 +251,9 @@ class DownloadLibrary:
             )
             trove_page_url = trove_base_url.format(idx=idx)
             try:
-                trove_r = self.session.get(trove_page_url)
+                trove_r = self.session.get(
+                    trove_page_url, timeout=self.download_timeout
+                )
             except Exception:
                 logger.error("Failed to get products from Humble Trove")
                 return []
@@ -222,6 +279,7 @@ class DownloadLibrary:
                     "content-type": "application/json",
                     "content-encoding": "gzip",
                 },
+                timeout=self.download_timeout,
             )
         except Exception:
             logger.error("Failed to get order key {order_id}".format(order_id=order_id))
@@ -453,10 +511,12 @@ class DownloadLibrary:
             raise FileExistsError
 
         try:
-            remote_file_r = self.session.get(remote_file, stream=True)
+            remote_file_r = self.session.get(
+                remote_file, stream=True, timeout=self.download_timeout
+            )
         except Exception:
             logger.exception(
-                "Failed to download {remote_file}".format(remote_file=remote_file)
+                "Failed to check {remote_file}".format(remote_file=remote_file)
             )
             return False
 
@@ -467,6 +527,7 @@ class DownloadLibrary:
                     remote_file=remote_file, status_code=remote_file_r.status_code
                 )
             )
+            remote_file_r.close()
             return False
 
         logger.debug(
@@ -480,6 +541,7 @@ class DownloadLibrary:
             if file_info["url_last_modified"] == cache_file_info.get(
                 "url_last_modified"
             ):
+                remote_file_r.close()
                 return False
         if "url_last_modified" in cache_file_info:
             last_modified = datetime.datetime.strptime(
@@ -487,6 +549,9 @@ class DownloadLibrary:
             ).strftime("%Y-%m-%d")
         else:
             last_modified = None
+
+        # Close the metadata check response; _download_file will make its own request
+        remote_file_r.close()
 
         local_file = os.path.join(local_folder, local_filename)
         # Create directory to save the file to, which might not exist if there's a subdirectory included
@@ -496,100 +561,166 @@ class DownloadLibrary:
             raise  # noqa: E701
 
         return self._process_download(
-            remote_file_r,
+            remote_file,
             cache_file_key,
             file_info,
             local_file,
             rename_str=last_modified,
         )
 
-    def _process_download(
-        self, open_r, cache_file_key, file_info, local_filename, rename_str=None
-    ):
+    def _remove_partial_file(self, local_filename):
         try:
-            if rename_str:
-                self._rename_old_file(local_filename, rename_str)
+            os.remove(local_filename)
+        except OSError:
+            pass
 
-            self._download_file(open_r, local_filename)
+    def _process_download(
+        self, url, cache_file_key, file_info, local_filename, rename_str=None
+    ):
+        if rename_str:
+            self._rename_old_file(local_filename, rename_str)
 
-        except (Exception, KeyboardInterrupt) as e:
-            if self.progress_bar:
-                # Do not overwrite the progress bar on next print
-                print()
-            logger.error(
-                "Failed to download file {local_filename}".format(
-                    local_filename=local_filename
+        for attempt in range(1 + self.retry_count):
+            if attempt > 0:
+                wait_time = min(2 ** attempt, 30)
+                logger.info(
+                    "Retry {attempt}/{retry_count} for {local_filename} "
+                    "in {wait}s...".format(
+                        attempt=attempt,
+                        retry_count=self.retry_count,
+                        local_filename=local_filename,
+                        wait=wait_time,
+                    )
                 )
-            )
+                time.sleep(wait_time)
 
-            # Clean up broken downloaded file
             try:
-                os.remove(local_filename)
-            except OSError:
-                pass
-
-            if type(e).__name__ == "KeyboardInterrupt":
+                self._download_file(url, local_filename)
+            except KeyboardInterrupt:
+                if self.progress_bar:
+                    print()
+                self._remove_partial_file(local_filename)
                 sys.exit()
+            except Exception as e:
+                if self.progress_bar:
+                    print()
+                logger.warning(
+                    "Download attempt {attempt} failed for "
+                    "{local_filename}: {error}".format(
+                        attempt=attempt + 1,
+                        local_filename=local_filename,
+                        error=e,
+                    )
+                )
+                # Keep partial file for resume on next attempt
+                continue
 
-            return False
-
-        else:
+            # Success
             if self.progress_bar:
-                # Do not overwrite the progress bar on next print
                 print()
             if "url_last_modified" not in file_info:
-                # no Last-Modified header so we set the time of the current download
-                # this will result in the file not being re-downloaded by default later
                 file_info["url_last_modified"] = datetime.datetime.now().strftime(
                     "%a, %d %b %Y %H:%M:%S %Z"
                 )
             self._update_cache_data(cache_file_key, file_info)
-
-        finally:
-            # Since its a stream connection, make sure to close it
-            open_r.connection.close()
             return True
 
-    def _download_file(self, product_r, local_filename):
+        # All retries exhausted
+        logger.error(
+            "Failed to download {local_filename} after {attempts} attempts".format(
+                local_filename=local_filename,
+                attempts=1 + self.retry_count,
+            )
+        )
+        self._remove_partial_file(local_filename)
+        return False
+
+    def _download_file(self, url, local_filename):
         logger.info(
             "Downloading: {local_filename}".format(local_filename=local_filename)
         )
 
-        with open(local_filename, "wb") as outfile:
-            total_length = product_r.headers.get("content-length")
-            if total_length is None:  # no content length header
-                dl = 0
-                for data in product_r.iter_content(chunk_size=4096):
-                    dl += len(data)
-                    outfile.write(data)
-                    if self.progress_bar:
-                        print(
-                            "\t{dl}".format(dl=dl),
-                            end="\r",
-                        )
-            else:
-                dl = 0
-                total_length = int(total_length)
-                for data in product_r.iter_content(chunk_size=4096):
-                    dl += len(data)
-                    outfile.write(data)
-                    pb_width = 50
-                    done = int(pb_width * dl / total_length)
-                    if self.progress_bar:
-                        print(
-                            "\t{percent}% [{filler}{space}]".format(
-                                percent=int(done * (100 / pb_width)),
-                                filler="=" * min(max(done, 0), pb_width),
-                                space=" " * min(max((pb_width - done), 0), pb_width),
-                            ),
-                            end="\r",
-                        )
+        request_headers = {}
+        existing_size = 0
 
-                if dl < total_length:
-                    raise ValueError("Download did not complete")
-                if dl > total_length:
-                    print()
-                    logger.warn("Downloaded more content than expected")
+        # Check for partial file to resume
+        if os.path.isfile(local_filename):
+            existing_size = os.path.getsize(local_filename)
+            if existing_size > 0:
+                request_headers["Range"] = "bytes={}-".format(existing_size)
+                logger.info(
+                    "Resuming from byte {size}".format(size=existing_size)
+                )
+
+        product_r = self.session.get(
+            url,
+            stream=True,
+            timeout=self.download_timeout,
+            headers=request_headers,
+        )
+
+        if product_r.status_code == 416:
+            # Range not satisfiable - file may be complete or changed
+            os.remove(local_filename)
+            existing_size = 0
+            product_r = self.session.get(
+                url, stream=True, timeout=self.download_timeout
+            )
+
+        if product_r.status_code not in (200, 206):
+            product_r.close()
+            raise ValueError(
+                "HTTP {code} for {url}".format(
+                    code=product_r.status_code, url=url
+                )
+            )
+
+        resumed = product_r.status_code == 206
+        if resumed:
+            file_mode = "ab"
+        else:
+            file_mode = "wb"
+            existing_size = 0
+
+        try:
+            with open(local_filename, file_mode) as outfile:
+                total_length = product_r.headers.get("content-length")
+                if total_length is None:  # no content length header
+                    dl = 0
+                    for data in product_r.iter_content(chunk_size=4096):
+                        dl += len(data)
+                        outfile.write(data)
+                        if self.progress_bar:
+                            print(
+                                "\t{dl}".format(dl=existing_size + dl),
+                                end="\r",
+                            )
+                else:
+                    dl = 0
+                    total_length = int(total_length)
+                    full_size = existing_size + total_length
+                    for data in product_r.iter_content(chunk_size=4096):
+                        dl += len(data)
+                        outfile.write(data)
+                        pb_width = 50
+                        done = int(pb_width * (existing_size + dl) / full_size)
+                        if self.progress_bar:
+                            print(
+                                "\t{percent}% [{filler}{space}]".format(
+                                    percent=int(done * (100 / pb_width)),
+                                    filler="=" * min(max(done, 0), pb_width),
+                                    space=" " * min(max((pb_width - done), 0), pb_width),
+                                ),
+                                end="\r",
+                            )
+
+                    if dl < total_length:
+                        raise ValueError("Download did not complete")
+                    if dl > total_length:
+                        print()
+                        logger.warning("Downloaded more content than expected")
+        finally:
+            product_r.close()
 
     def _load_cache_data(self, cache_file):
         try:
@@ -602,7 +733,10 @@ class DownloadLibrary:
 
     def _get_purchase_keys(self):
         try:
-            library_r = self.session.get("https://www.humblebundle.com/home/library")
+            library_r = self.session.get(
+                "https://www.humblebundle.com/home/library",
+                timeout=self.download_timeout,
+            )
         except Exception:
             logger.exception("Failed to get list of purchases")
             return []
