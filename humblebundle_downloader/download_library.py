@@ -694,6 +694,7 @@ class DownloadLibrary:
                             print(
                                 "\t{dl}".format(dl=existing_size + dl),
                                 end="\r",
+                                flush=True,
                             )
                 else:
                     dl = 0
@@ -712,6 +713,7 @@ class DownloadLibrary:
                                     space=" " * min(max((pb_width - done), 0), pb_width),
                                 ),
                                 end="\r",
+                                flush=True,
                             )
 
                     if dl < total_length:
