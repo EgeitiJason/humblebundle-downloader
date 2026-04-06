@@ -74,6 +74,7 @@ class DownloadLibrary:
         self.retry_count = retry_count
         self.max_workers = max_workers
         self._cache_lock = threading.Lock()
+        self._overall_bar = None
         self._bar_positions = queue.Queue()
         for i in range(max_workers):
             self._bar_positions.put(i)
@@ -100,15 +101,49 @@ class DownloadLibrary:
             self.purchase_keys if self.purchase_keys else self._get_purchase_keys()
         )
 
-        # When progress bars are active, route all log output through
-        # tqdm.write() so messages appear cleanly above the bars
-        if self.progress_bar:
-            root_logger = logging.getLogger()
-            original_handlers = root_logger.handlers[:]
-            root_logger.handlers.clear()
-            tqdm_handler = TqdmLoggingHandler()
-            tqdm_handler.setFormatter(logging.Formatter("%(message)s"))
-            root_logger.addHandler(tqdm_handler)
+        # Route all log output through tqdm.write() so messages appear
+        # cleanly above progress bars
+        root_logger = logging.getLogger()
+        original_handlers = root_logger.handlers[:]
+        root_logger.handlers.clear()
+        tqdm_handler = TqdmLoggingHandler()
+        tqdm_handler.setFormatter(logging.Formatter("%(message)s"))
+        root_logger.addHandler(tqdm_handler)
+
+        # Phase 1: Fetch all data and count total items
+        if self.trove is True:
+            logger.info("Only checking the Humble Trove...")
+            trove_products = self._get_trove_products()
+            total_items = sum(
+                len(product.get("downloads", {}))
+                for product in trove_products
+            )
+        else:
+            orders = []
+            total_items = 0
+            for order_id in self.purchase_keys:
+                order = self._fetch_order(order_id)
+                if order is None:
+                    continue
+                bundle_title = _clean_name(order["product"]["human_name"])
+                logger.info("Checking bundle: " + str(bundle_title))
+                orders.append((order_id, bundle_title, order))
+                for product in order["subproducts"]:
+                    for download_type in product["downloads"]:
+                        total_items += len(
+                            download_type.get("download_struct", [])
+                        )
+
+        # Phase 2: Download with known total
+        bar_pos = self.max_workers if self.progress_bar else 0
+        self._overall_bar = tqdm(
+            total=total_items,
+            unit=" items",
+            desc="Overall",
+            position=bar_pos,
+            leave=True,
+            bar_format="{desc}: {n_fmt}/{total_fmt}{unit} [{elapsed}]",
+        )
 
         try:
             with concurrent.futures.ThreadPoolExecutor(
@@ -116,19 +151,35 @@ class DownloadLibrary:
             ) as executor:
                 self._executor = executor
                 if self.trove is True:
-                    logger.info("Only checking the Humble Trove...")
-                    for product in self._get_trove_products():
+                    for product in trove_products:
                         title = _clean_name(product["human-name"])
                         self._process_trove_product(title, product)
                 else:
-                    for order_id in self.purchase_keys:
-                        self._process_order_id(order_id)
+                    for order_id, bundle_title, order in orders:
+                        for product in order["subproducts"]:
+                            self._executor.submit(
+                                self._process_product,
+                                order_id,
+                                bundle_title,
+                                product,
+                            )
                 # Wait for all submitted downloads to complete
                 executor.shutdown(wait=True)
         finally:
-            if self.progress_bar:
-                root_logger.removeHandler(tqdm_handler)
-                root_logger.handlers = original_handlers
+            self._overall_bar.close()
+            self._overall_bar = None
+            root_logger.removeHandler(tqdm_handler)
+            root_logger.handlers = original_handlers
+
+    def _item_done(self):
+        if self._overall_bar is not None:
+            self._overall_bar.update(1)
+
+    def _adjust_total(self, count):
+        if self._overall_bar is not None:
+            with self._cache_lock:
+                self._overall_bar.total += count
+                self._overall_bar.refresh()
 
     def _get_trove_download_url(self, machine_name, web_name):
         try:
@@ -168,10 +219,12 @@ class DownloadLibrary:
                         platform=platform, product_title=title
                     )
                 )
+                self._item_done()
                 continue
 
             web_name = download["url"]["web"].split("/")[-1]
             if self._should_download_file_by_ext_and_log(web_name) is False:
+                self._item_done()
                 continue
 
             cache_file_key = "trove:{name}".format(name=web_name)
@@ -188,6 +241,7 @@ class DownloadLibrary:
 
             if cache_file_info != {} and self.update is not True:
                 # Do not care about checking for updates at this time
+                self._item_done()
                 continue
 
             if file_info["uploaded_at"] != cache_file_info.get(
@@ -220,6 +274,8 @@ class DownloadLibrary:
                     local_filename,
                     rename_str=uploaded_at,
                 )
+            else:
+                self._item_done()
 
     def _download_trove_file(
         self, download, web_name, cache_file_key, file_info,
@@ -267,6 +323,7 @@ class DownloadLibrary:
 
             # Success
             self._update_cache_data(cache_file_key, file_info)
+            self._item_done()
             return True
 
         logger.error(
@@ -277,6 +334,7 @@ class DownloadLibrary:
             )
         )
         self._remove_partial_file(local_filename)
+        self._item_done()
         return False
 
     def _get_trove_products(self):
@@ -306,7 +364,7 @@ class DownloadLibrary:
 
         return trove_products
 
-    def _process_order_id(self, order_id):
+    def _fetch_order(self, order_id):
         order_url = "https://www.humblebundle.com/api/v1/order/{order_id}?all_tpkds=true".format(
             order_id=order_id
         )
@@ -321,16 +379,10 @@ class DownloadLibrary:
             )
         except Exception:
             logger.error("Failed to get order key {order_id}".format(order_id=order_id))
-            return
+            return None
 
         logger.debug("Order request: {order_r}".format(order_r=order_r))
-        order = order_r.json()
-        bundle_title = _clean_name(order["product"]["human_name"])
-        logger.info("Checking bundle: " + str(bundle_title))
-        for product in order["subproducts"]:
-            self._executor.submit(
-                self._process_product, order_id, bundle_title, product
-            )
+        return order_r.json()
 
     def _rename_old_file(self, local_filename, append_str):
         # Check if older file exists, if so rename
@@ -346,12 +398,15 @@ class DownloadLibrary:
         product_title = _clean_name(product["human_name"])
         # Get all types of download for a product
         for download_type in product["downloads"]:
+            num_files = len(download_type.get("download_struct", []))
             if self._should_download_platform(download_type["platform"]) is False:
                 logger.info(
                     "Skipping {platform} for {product_title}".format(
                         platform=download_type["platform"], product_title=product_title
                     )
                 )
+                for _ in range(num_files):
+                    self._item_done()
                 continue
 
             product_folder = os.path.join(
@@ -376,6 +431,7 @@ class DownloadLibrary:
                             self._should_download_file_by_ext_and_log(url_filename)
                             is False
                         ):
+                            self._item_done()
                             continue
 
                         cache_file_key = order_id + ":" + url_filename
@@ -384,9 +440,11 @@ class DownloadLibrary:
                                 cache_file_key, url, product_folder, url_filename
                             )
                         except FileExistsError:
+                            self._item_done()
                             continue
                         except Exception:
                             logger.exception("Failed to download {url}".format(url=url))
+                        self._item_done()
                     elif "asm_config" in file_type:
                         # asm.js game playable directly in the browser
                         game_name = file_type["asm_config"]["display_item"]
@@ -418,8 +476,8 @@ class DownloadLibrary:
                             )
                             is False
                         ):
+                            self._item_done()
                             continue
-
                         downloaded = False
                         try:
                             downloaded = self._check_cache_and_download(
@@ -429,14 +487,18 @@ class DownloadLibrary:
                                 asmjs_html_filename,
                             )
                         except FileExistsError:
-                            pass  # we should download the asm/data files even if the html file was previously downloaded
+                            self._item_done()
+                            # we should download the asm/data files even if the html file was previously downloaded
                         except Exception:
                             logger.exception(
                                 "Failed to download {asmjs_url}".format(
                                     asmjs_url=asmjs_url
                                 )
                             )
+                            self._item_done()
                             continue
+                        else:
+                            self._item_done()
 
                         # read from the html file a version of file_type['asm_manifest'] with HMAC/etc auth params on the URLs
                         with open(
@@ -481,9 +543,9 @@ class DownloadLibrary:
                                 )
 
                         # TODO deduplicate these files? Osmos example has 3 unique files and 2 dupes with different names
-                        for local_filename, remote_file in asm_player_data[
-                            "asmOptions"
-                        ]["manifest"].items():
+                        manifest_items = asm_player_data["asmOptions"]["manifest"]
+                        self._adjust_total(len(manifest_items))
+                        for local_filename, remote_file in manifest_items.items():
                             cache_file_key = (
                                 order_id + ":" + game_name + ":" + local_filename
                             )
@@ -495,12 +557,15 @@ class DownloadLibrary:
                                     local_filename,
                                 )
                             except FileExistsError:
+                                self._item_done()
                                 continue
                             except Exception:
                                 logger.exception(
                                     "Failed to download {url}".format(url=url)
                                 )
+                                self._item_done()
                                 continue
+                            self._item_done()
 
                     elif "external_link" in file_type:
                         logger.info(
@@ -510,6 +575,7 @@ class DownloadLibrary:
                                 url=file_type["external_link"],
                             )
                         )
+                        self._item_done()
 
                     else:
                         logger.info(
@@ -518,6 +584,7 @@ class DownloadLibrary:
                             )
                         )
                         logger.info(file_type)
+                        self._item_done()
                         continue
                 except Exception:
                     logger.exception(
