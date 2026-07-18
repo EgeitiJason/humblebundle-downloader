@@ -159,13 +159,12 @@ class DownloadLibrary:
                         title = _clean_name(product["human-name"])
                         self._process_trove_product(title, product)
                 else:
+                    # Queue every file as its own task so the pool stays
+                    # saturated; products themselves download nothing
                     for order_id, bundle_title, order in orders:
                         for product in order["subproducts"]:
-                            self._executor.submit(
-                                self._process_product,
-                                order_id,
-                                bundle_title,
-                                product,
+                            self._process_product(
+                                order_id, bundle_title, product
                             )
                 # Wait for all submitted downloads to complete
                 executor.shutdown(wait=True)
@@ -439,138 +438,23 @@ class DownloadLibrary:
                             continue
 
                         cache_file_key = order_id + ":" + url_filename
-                        try:
-                            self._check_cache_and_download(
-                                cache_file_key, url, product_folder, url_filename
-                            )
-                        except FileExistsError:
-                            self._item_done()
-                            continue
-                        except Exception:
-                            logger.exception("Failed to download {url}".format(url=url))
-                        self._item_done()
-                    elif "asm_config" in file_type:
-                        # asm.js game playable directly in the browser
-                        game_name = file_type["asm_config"]["display_item"]
-                        local_folder = os.path.join(product_folder, game_name)
-                        # Create directory to save the files to
-                        try:
-                            os.makedirs(local_folder, exist_ok=True)  # noqa: E701
-                        except OSError:
-                            pass  # noqa: E701
-
-                        # get the HTML file that presents the game, used in the Humble web interface iframe
-                        asmjs_html_filename = game_name + ".html"
-                        asmjs_local_html_filename = game_name + ".local.html"
-                        cache_file_key = order_id + ":" + asmjs_html_filename
-                        # game_name might be "game" or "game_asm" but the path to the file here always uses the "game_asm" version
-                        game_asm_name = file_type["asm_manifest"]["asmFile"].split("/")[
-                            2
-                        ]
-                        asmjs_url = (
-                            "https://www.humblebundle.com/play/asmjs/"
-                            + game_asm_name
-                            + "/"
-                            + order_id
+                        self._executor.submit(
+                            self._download_web_file,
+                            cache_file_key,
+                            url,
+                            product_folder,
+                            url_filename,
                         )
-
-                        if (
-                            self._should_download_file_by_ext_and_log(
-                                asmjs_html_filename
-                            )
-                            is False
-                        ):
-                            self._item_done()
-                            continue
-                        downloaded = False
-                        try:
-                            downloaded = self._check_cache_and_download(
-                                cache_file_key,
-                                asmjs_url,
-                                local_folder,
-                                asmjs_html_filename,
-                            )
-                        except FileExistsError:
-                            self._item_done()
-                            # we should download the asm/data files even if the html file was previously downloaded
-                        except Exception:
-                            logger.exception(
-                                "Failed to download {asmjs_url}".format(
-                                    asmjs_url=asmjs_url
-                                )
-                            )
-                            self._item_done()
-                            continue
-                        else:
-                            self._item_done()
-
-                        # read from the html file a version of file_type['asm_manifest'] with HMAC/etc auth params on the URLs
-                        with open(
-                            os.path.join(local_folder, asmjs_html_filename), "r"
-                        ) as asmjs_html:
-                            asmjs_page = parsel.Selector(text=asmjs_html.read())
-                            asm_player_data_text = asmjs_page.css(
-                                "#webpack-asm-player-data::text"
-                            ).get()  # noqa: E501
-                            asm_player_data = json.loads(asm_player_data_text)
-
-                        if downloaded:
-                            # create the local playable version of the html file
-                            # by replacing remote manifest URLs with the local filename
-                            try:
-                                with open(
-                                    os.path.join(local_folder, asmjs_html_filename), "r"
-                                ) as asmjs_html:
-                                    with open(
-                                        os.path.join(
-                                            local_folder, asmjs_local_html_filename
-                                        ),
-                                        "w",
-                                    ) as asmjs_local_html:
-                                        for line in asmjs_html:
-                                            for (
-                                                local_filename,
-                                                remote_file,
-                                            ) in asm_player_data["asmOptions"][
-                                                "manifest"
-                                            ].items():
-                                                line = line.replace(
-                                                    f'"{local_filename}": "{remote_file}"',
-                                                    f'"{local_filename}": "{local_filename}"',
-                                                )
-                                            asmjs_local_html.write(line)
-                            except Exception:
-                                logger.exception(
-                                    "Failed to create local version of {asmjs_html_filename}".format(
-                                        asmjs_html_filename=asmjs_html_filename
-                                    )
-                                )
-
-                        # TODO deduplicate these files? Osmos example has 3 unique files and 2 dupes with different names
-                        manifest_items = asm_player_data["asmOptions"]["manifest"]
-                        self._adjust_total(len(manifest_items))
-                        for local_filename, remote_file in manifest_items.items():
-                            cache_file_key = (
-                                order_id + ":" + game_name + ":" + local_filename
-                            )
-                            try:
-                                self._check_cache_and_download(
-                                    cache_file_key,
-                                    remote_file,
-                                    local_folder,
-                                    local_filename,
-                                )
-                            except FileExistsError:
-                                self._item_done()
-                                continue
-                            except Exception:
-                                logger.exception(
-                                    "Failed to download {url}".format(url=url)
-                                )
-                                self._item_done()
-                                continue
-                            self._item_done()
-
+                    elif "asm_config" in file_type:
+                        # asm.js game playable directly in the browser.
+                        # One task for the whole game: the manifest files
+                        # can only be found after the html is downloaded
+                        self._executor.submit(
+                            self._process_asmjs,
+                            order_id,
+                            product_folder,
+                            file_type,
+                        )
                     elif "external_link" in file_type:
                         logger.info(
                             "External url found: {bundle_title}/{product_title} : {url}".format(
@@ -597,6 +481,129 @@ class DownloadLibrary:
                         )
                     )
                     continue
+
+    def _download_web_file(self, cache_file_key, url, product_folder, url_filename):
+        try:
+            self._check_cache_and_download(
+                cache_file_key, url, product_folder, url_filename
+            )
+        except FileExistsError:
+            pass
+        except Exception:
+            logger.exception("Failed to download {url}".format(url=url))
+        self._item_done()
+
+    def _process_asmjs(self, order_id, product_folder, file_type):
+        try:
+            self._process_asmjs_inner(order_id, product_folder, file_type)
+        except Exception:
+            # Log here; exceptions in pool tasks are otherwise silent
+            logger.exception(
+                "Failed to download this 'file':\n{file_type}".format(
+                    file_type=file_type
+                )
+            )
+
+    def _process_asmjs_inner(self, order_id, product_folder, file_type):
+        game_name = file_type["asm_config"]["display_item"]
+        local_folder = os.path.join(product_folder, game_name)
+        # Create directory to save the files to
+        try:
+            os.makedirs(local_folder, exist_ok=True)  # noqa: E701
+        except OSError:
+            pass  # noqa: E701
+
+        # get the HTML file that presents the game, used in the Humble web interface iframe
+        asmjs_html_filename = game_name + ".html"
+        asmjs_local_html_filename = game_name + ".local.html"
+        cache_file_key = order_id + ":" + asmjs_html_filename
+        # game_name might be "game" or "game_asm" but the path to the file here always uses the "game_asm" version
+        game_asm_name = file_type["asm_manifest"]["asmFile"].split("/")[2]
+        asmjs_url = (
+            "https://www.humblebundle.com/play/asmjs/" + game_asm_name + "/" + order_id
+        )
+
+        if self._should_download_file_by_ext_and_log(asmjs_html_filename) is False:
+            self._item_done()
+            return
+        downloaded = False
+        try:
+            downloaded = self._check_cache_and_download(
+                cache_file_key,
+                asmjs_url,
+                local_folder,
+                asmjs_html_filename,
+            )
+        except FileExistsError:
+            self._item_done()
+            # we should download the asm/data files even if the html file was previously downloaded
+        except Exception:
+            logger.exception(
+                "Failed to download {asmjs_url}".format(asmjs_url=asmjs_url)
+            )
+            self._item_done()
+            return
+        else:
+            self._item_done()
+
+        # read from the html file a version of file_type['asm_manifest'] with HMAC/etc auth params on the URLs
+        with open(os.path.join(local_folder, asmjs_html_filename), "r") as asmjs_html:
+            asmjs_page = parsel.Selector(text=asmjs_html.read())
+            asm_player_data_text = asmjs_page.css(
+                "#webpack-asm-player-data::text"
+            ).get()  # noqa: E501
+            asm_player_data = json.loads(asm_player_data_text)
+
+        if downloaded:
+            # create the local playable version of the html file
+            # by replacing remote manifest URLs with the local filename
+            try:
+                with open(
+                    os.path.join(local_folder, asmjs_html_filename), "r"
+                ) as asmjs_html:
+                    with open(
+                        os.path.join(local_folder, asmjs_local_html_filename),
+                        "w",
+                    ) as asmjs_local_html:
+                        for line in asmjs_html:
+                            for (
+                                local_filename,
+                                remote_file,
+                            ) in asm_player_data["asmOptions"]["manifest"].items():
+                                line = line.replace(
+                                    f'"{local_filename}": "{remote_file}"',
+                                    f'"{local_filename}": "{local_filename}"',
+                                )
+                            asmjs_local_html.write(line)
+            except Exception:
+                logger.exception(
+                    "Failed to create local version of {asmjs_html_filename}".format(
+                        asmjs_html_filename=asmjs_html_filename
+                    )
+                )
+
+        # TODO deduplicate these files? Osmos example has 3 unique files and 2 dupes with different names
+        manifest_items = asm_player_data["asmOptions"]["manifest"]
+        self._adjust_total(len(manifest_items))
+        for local_filename, remote_file in manifest_items.items():
+            cache_file_key = order_id + ":" + game_name + ":" + local_filename
+            try:
+                self._check_cache_and_download(
+                    cache_file_key,
+                    remote_file,
+                    local_folder,
+                    local_filename,
+                )
+            except FileExistsError:
+                self._item_done()
+                continue
+            except Exception:
+                logger.exception(
+                    "Failed to download {url}".format(url=remote_file)
+                )
+                self._item_done()
+                continue
+            self._item_done()
 
     def _update_cache_data(self, cache_file_key, file_info):
         with self._cache_lock:
