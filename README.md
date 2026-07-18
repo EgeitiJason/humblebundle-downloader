@@ -15,7 +15,7 @@ After that it will only download the content that has been updated or is missing
 - downloads new and updated content from your Humble Bundle Library on each run _(only check for updates if using `--update`)_
 - cli command for easy use (downloading will also work on a headless system)
 - works for SSO and 2FA accounts
-- optional progress bar for each item downloaded _(`--progress` flag)_
+- parallel downloads with pacman-style progress bars, enabled by default _(`-w/--concurrent` and `--no-progress` flags)_
 - optional filter by file types using an include _or_ exclude list _(`--include/--exclude` flag)_
 - optional filter by platform types like video, ebook, etc... _(`--platform` flag)_
 
@@ -26,6 +26,28 @@ After that it will only download the content that has been updated or is missing
 ### Using PIP
 
 `pip install humblebundle-downloader`
+
+
+### Updating an existing pip install to this code
+
+The package on PyPI does not include the newest features from this repository
+(parallel downloads with pacman-style progress bars, download resume/retry).
+To replace a previous `pip install humblebundle-downloader` with this code:
+
+```bash
+pip uninstall humblebundle-downloader
+pip install git+https://github.com/EgeitiJason/humblebundle-downloader.git
+```
+
+If you have a local clone instead, run this from the repository root
+(also how you update after a `git pull`):
+
+```bash
+pip install --upgrade .
+```
+
+Run `hbd --help` afterwards to confirm the new options (e.g. `--no-progress`,
+`-w/--concurrent` defaulting to 5) are available.
 
 
 ### From source using a virtual environment
@@ -78,7 +100,7 @@ This can be done by getting a browser extension that lets you see or export your
 ### 2. Downloading your library
 
 Use the following command to download your Humble Bundle Library:  
-`hbd --cookie-file cookies.txt --library-path "Downloaded Library" --progress`  
+`hbd --cookie-file cookies.txt --library-path "Downloaded Library"`  
 _If using the docker image, exclude the `hbd` part of the command_
 
 This directory structure will be used:  
