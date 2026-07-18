@@ -28,6 +28,28 @@ After that it will only download the content that has been updated or is missing
 `pip install humblebundle-downloader`
 
 
+### From source using a virtual environment
+
+Requires Python 3.10 or newer.
+
+```bash
+# Clone the repository
+git clone https://github.com/xtream1101/humblebundle-downloader.git
+cd humblebundle-downloader
+
+# Create and activate a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
+
+# Install the package into the virtual environment
+pip install .
+```
+
+The `hbd` command is now available whenever the virtual environment is active.
+Re-activate it in new shell sessions with `source .venv/bin/activate`,
+or deactivate it with `deactivate`.
+
+
 ### Using docker
 
 Remember to mount your download directory in the container using dockers `-v` argument.
