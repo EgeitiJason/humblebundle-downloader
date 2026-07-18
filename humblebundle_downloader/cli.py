@@ -65,9 +65,17 @@ def parse_args(args):
     )
     parser.add_argument(
         "--progress",
+        dest="progress",
         action="store_true",
-        help="Display progress bar for downloads",
+        help="Display progress bars for downloads (default: enabled)",
     )
+    parser.add_argument(
+        "--no-progress",
+        dest="progress",
+        action="store_false",
+        help="Disable download progress bars",
+    )
+    parser.set_defaults(progress=True)
     filter_ext = parser.add_mutually_exclusive_group()
     filter_ext.add_argument(
         "-e",
@@ -116,10 +124,10 @@ def parse_args(args):
         "-w",
         "--concurrent",
         type=int,
-        default=1,
+        default=5,
         help=(
-            "Number of simultaneous downloads. "
-            "Progress bars are disabled when > 1 (default: 1)"
+            "Number of simultaneous downloads, each with its own "
+            "progress bar (default: 5)"
         ),
     )
 

@@ -138,11 +138,15 @@ class DownloadLibrary:
         bar_pos = self.max_workers if self.progress_bar else 0
         self._overall_bar = tqdm(
             total=total_items,
-            unit=" items",
-            desc="Overall",
+            desc="Total",
             position=bar_pos,
             leave=True,
-            bar_format="{desc}: {n_fmt}/{total_fmt}{unit} [{elapsed}]",
+            ascii="-#",
+            dynamic_ncols=True,
+            bar_format=(
+                " {desc:<24.24} ({n_fmt:>4}/{total_fmt}) items"
+                " {elapsed:>8} [{bar}] {percentage:3.0f}%"
+            ),
         )
 
         try:
@@ -817,14 +821,30 @@ class DownloadLibrary:
 
             if self.progress_bar:
                 bar_position = self._bar_positions.get()
+                if total_length:
+                    bar_format = (
+                        " {desc:<24.24} {total_fmt:>9}B"
+                        " {rate_fmt:>11} {remaining:>6}"
+                        " [{bar}] {percentage:3.0f}%"
+                    )
+                else:
+                    # Size unknown; no bar/ETA possible
+                    bar_format = (
+                        " {desc:<24.24} {n_fmt:>9}B"
+                        " {rate_fmt:>11} {elapsed:>6}"
+                    )
                 progress = tqdm(
                     total=(existing_size + total_length) if total_length else None,
                     initial=existing_size,
                     unit="B",
                     unit_scale=True,
+                    unit_divisor=1024,
                     desc=display_name,
                     position=bar_position,
                     leave=False,
+                    ascii="-#",
+                    dynamic_ncols=True,
+                    bar_format=bar_format,
                     miniters=1,
                 )
 
