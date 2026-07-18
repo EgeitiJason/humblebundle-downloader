@@ -599,13 +599,39 @@ class DownloadLibrary:
             self.cache_data[cache_file_key] = file_info
             # Update cache file with newest data so if the script
             # quits it can keep track of the progress
-            with open(self.cache_file, "w") as outfile:
-                json.dump(
-                    self.cache_data,
-                    outfile,
-                    sort_keys=True,
-                    indent=4,
+            # Write to a temp file and replace it over the cache so the
+            # cache is never left truncated, and so it works even if the
+            # old cache file itself is not writable (only the directory
+            # needs to be). Network shares can also return transient
+            # permission errors, so retry before giving up.
+            temp_file = self.cache_file + ".tmp"
+            last_error = None
+            for attempt in range(3):
+                try:
+                    with open(temp_file, "w") as outfile:
+                        json.dump(
+                            self.cache_data,
+                            outfile,
+                            sort_keys=True,
+                            indent=4,
+                        )
+                    os.replace(temp_file, self.cache_file)
+                    return
+                except OSError as e:
+                    last_error = e
+                    time.sleep(0.5 * (attempt + 1))
+
+            try:
+                os.remove(temp_file)
+            except OSError:
+                pass
+            # A failed cache write should not fail the item; the file
+            # already downloaded fine, it will just be re-checked next run
+            logger.warning(
+                "Failed to update cache file {cache_file}: {error}".format(
+                    cache_file=self.cache_file, error=last_error
                 )
+            )
 
     def _check_cache_and_download(
         self, cache_file_key, remote_file, local_folder, local_filename
